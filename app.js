@@ -1,4 +1,4 @@
-import {SRC, RANGE, HELP, TERM, traceInsert, traceSearch, vis, q, esc} from './art.js';
+import {SRC, RANGE, HELP, TERM, traceInsert, traceSearch, vis, q, esc} from './art.js?v=3';
 
 const SCEN = {
   patricia: {
