@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>ART – Adaptive Radix Tree, line by line</title>
+    <meta
+      name="description"
+      content="Step through insert and search in an Adaptive Radix Tree one executed line at a time: the code, the key bytes, the tree and the locals."
+    />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=TikTok+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="site">
+      <a class="logo" href="./"><img src="favicon.svg" alt="" width="30" height="30" /><span>art<span class="js">-viz</span></span></a>
+      <nav class="site">
+        <a href="https://lamng3.com/" class="wide">lamng3.com</a>
+        <a href="https://github.com/lamng3/art-visualization" class="pill" target="_blank" rel="noopener">GitHub ↗</a>
+      </nav>
+    </header>
+
+    <div class="app">
+      <section class="top">
+        <h1>Adaptive Radix Tree, one line at a time</h1>
+        <p class="lede">
+          Each slide is one executed line of <code>insert</code> or <code>search</code>. The tree, the key bytes and the locals show the
+          state right after that line runs.
+        </p>
+      </section>
+
+      <form class="run" id="runForm" novalidate>
+        <div class="fld">
+          <span class="lbl" id="opLbl">Operation</span>
+          <div class="seg" role="group" aria-labelledby="opLbl">
+            <button type="button" id="opInsert" aria-pressed="true">insert</button>
+            <button type="button" id="opSearch" aria-pressed="false">search</button>
+          </div>
+        </div>
+        <div class="fld">
+          <label for="preset">Scenario</label>
+          <select id="preset">
+            <option value="patricia">Patricia classic</option>
+            <option value="grow">Node growth</option>
+            <option value="term">Prefix keys + TERM</option>
+            <option value="dup">Duplicate key</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+        <div class="fld grow">
+          <label for="words">Words, in insert order</label>
+          <input id="words" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="fld grow" id="fldQ" hidden>
+          <label for="queries">Search for</label>
+          <input id="queries" autocomplete="off" spellcheck="false" />
+        </div>
+        <button class="btn primary" type="submit">Run</button>
+      </form>
+      <p class="hint" id="hint"></p>
+      <p class="err" id="err" hidden></p>
+      <nav class="chips" id="chips" aria-label="Jump to an operation"></nav>
+
+      <main class="grid">
+        <section class="pane note" id="note" aria-live="polite"></section>
+
+        <section class="pane code-pane">
+          <div class="ph"><h2>Source</h2><span class="meta" id="codeMeta"></span></div>
+          <div class="code" id="code"></div>
+          <div class="helper" id="helper" hidden></div>
+        </section>
+
+        <section class="pane key-pane">
+          <div class="ph"><h2>Key bytes</h2><span class="meta" id="keyMeta"></span></div>
+          <div class="kwrap"><div id="keyStrip"></div></div>
+        </section>
+
+        <section class="pane tree-pane">
+          <div class="ph">
+            <h2>Tree <span class="keys" id="keyCount"></span></h2>
+            <div class="legend">
+              <span><i class="lc"></i>node in this frame</span>
+              <span><i class="lp"></i>on the call path</span>
+              <span><i class="lf"></i>created, changed or found</span>
+              <span><i class="lb"></i>mismatch</span>
+              <span><span class="imp">rom</span> implied by path</span>
+              <span><span class="tm">␀</span> TERM</span>
+            </div>
+          </div>
+          <div class="twrap" id="tree"></div>
+        </section>
+
+        <div class="lower">
+          <section class="pane" id="scratchPane">
+            <div class="ph"><h2>Detached nodes</h2><span class="meta">built, not yet linked from root</span></div>
+            <div class="scratch" id="scratch"></div>
+          </section>
+          <section class="pane">
+            <div class="ph"><h2>Locals</h2><span class="meta">dot = changed this line</span></div>
+            <table class="vars" id="vars"></table>
+            <div class="ph ph-b"><h2>Call stack</h2></div>
+            <ol class="stack" id="stack"></ol>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <footer class="bar">
+      <div class="bar-in">
+        <button class="btn" id="first" aria-label="First step">⏮</button>
+        <button class="btn" id="prev">← Prev</button>
+        <button class="btn" id="play">Play</button>
+        <button class="btn primary" id="next">Next →</button>
+        <input type="range" id="scrub" min="0" max="0" value="0" aria-label="Step" />
+        <select id="speed" class="btn" aria-label="Playback speed">
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+        </select>
+        <span class="ctr" id="ctr"></span>
+      </div>
+    </footer>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
