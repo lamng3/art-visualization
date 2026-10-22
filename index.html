@@ -15,7 +15,7 @@
       href="https://fonts.googleapis.com/css2?family=TikTok+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="style.css?v=3" />
+    <link rel="stylesheet" href="style.css?v=4" />
   </head>
   <body>
     <header class="site">
@@ -30,7 +30,7 @@
       <section class="top">
         <h1>Adaptive Radix Tree, one line at a time</h1>
         <p class="lede">
-          Each slide is one executed line of <code>insert</code> or <code>search</code>. The tree, the key bytes and the locals show the
+          Each slide is one executed line of <code>insert</code>, <code>search</code> or a range scan. The tree, the key bytes and the locals show the
           state right after that line runs.
         </p>
       </section>
@@ -41,6 +41,7 @@
           <div class="seg" role="group" aria-labelledby="opLbl">
             <button type="button" id="opInsert" aria-pressed="true">insert</button>
             <button type="button" id="opSearch" aria-pressed="false">search</button>
+            <button type="button" id="opRange" aria-pressed="false">range</button>
           </div>
         </div>
         <div class="fld">
@@ -60,6 +61,14 @@
         <div class="fld grow" id="fldQ" hidden>
           <label for="queries">Search for</label>
           <input id="queries" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="fld sm" id="fldLo" hidden>
+          <label for="lo">From (lo)</label>
+          <input id="lo" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="fld sm" id="fldHi" hidden>
+          <label for="hi">To (hi)</label>
+          <input id="hi" autocomplete="off" spellcheck="false" />
         </div>
         <button class="btn primary" type="submit">Run</button>
       </form>
@@ -86,9 +95,13 @@
             <h2>Tree <span class="keys" id="keyCount"></span></h2>
             <div class="legend">
               <span><i class="lc"></i>node in this frame</span>
-              <span><i class="lp"></i>on the call path</span>
-              <span><i class="lf"></i>created, changed or found</span>
-              <span><i class="lb"></i>mismatch</span>
+              <span data-op="insert search"><i class="lp"></i>on the call path</span>
+              <span data-op="range"><i class="lp"></i>on the iterator stack</span>
+              <span data-op="insert search"><i class="lf"></i>created, changed or found</span>
+              <span data-op="insert search"><i class="lb"></i>mismatch</span>
+              <span data-op="range"><i class="lr"></i>in range</span>
+              <span data-op="range"><i class="lo"></i>already returned</span>
+              <span data-op="range"><i class="le"></i>range end</span>
               <span><span class="imp">rom</span> implied by path</span>
               <span><span class="tm">␀</span> TERM</span>
             </div>
@@ -98,7 +111,7 @@
 
         <div class="lower">
           <section class="pane" id="scratchPane">
-            <div class="ph"><h2>Detached nodes</h2><span class="meta">built, not yet linked from root</span></div>
+            <div class="ph"><h2 id="scratchH">Detached nodes</h2><span class="meta" id="scratchM">built, not yet linked from root</span></div>
             <div class="scratch" id="scratch"></div>
           </section>
           <section class="pane">
@@ -109,6 +122,26 @@
           </section>
         </div>
       </main>
+
+      <section class="why" aria-labelledby="whyH">
+        <h2 id="whyH">Why an ART?</h2>
+        <div class="why-grid">
+          <ul>
+            <li><b>Compact, two ways.</b> Vertically, path compression and lazy expansion skip chains of single-child nodes. Horizontally, a node is only as wide as its fanout needs: Node4, 16, 48, 256 as children arrive. That is closer to right-sizing an allocation than to compressing it.</li>
+            <li><b>Cache-friendly.</b> The inner nodes are small, so the hot ones fit in CPU caches.</li>
+            <li><b>Fast point queries.</b> A lookup costs O(k) in the key length, whatever the number of keys.</li>
+            <li><b>No rehash cliff.</b> An insert may grow one node (Node4 → Node16), which is cheap. Many hash tables must rebuild everything at some size.</li>
+            <li><b>Range scans work.</b> Unlike a hash table, an ART keeps keys in order. It is slower than a B+ tree, which walks sibling links between leaves, because it must climb and descend. One structure then serves constraint checks and range queries.</li>
+          </ul>
+          <div class="why-card">
+            <h3>Pessimistic or optimistic prefixes</h3>
+            <p><b>Pessimistic</b> (this code): each inner node stores its prefix bytes, so a lookup compares them on the way down and stops at the first wrong byte. The cost is variable-length storage per node.</p>
+            <p><b>Optimistic</b>: store only the prefix length, skip those bytes without comparing, and verify the whole key once at the leaf. Nodes are smaller, but a wrong path is only noticed at the leaf.</p>
+            <p>For a range scan the difference shows up in the seek. With stored bytes, <code>node.content != part</code> tells which side of lo a whole subtree is on. With skipped bytes, the seek would have to load a leaf key from the subtree to find out. The upper bound needs no jumping: a second seek finds the first word past hi.</p>
+          </div>
+        </div>
+        <p class="src">After <a href="https://duckdb.org/2022/07/27/art-storage" target="_blank" rel="noopener">DuckDB: Indexes in DuckDB (ART storage)</a> and the ART paper by Leis et al.</p>
+      </section>
     </div>
 
     <footer class="bar">
@@ -127,6 +160,6 @@
       </div>
     </footer>
 
-    <script type="module" src="app.js?v=3"></script>
+    <script type="module" src="app.js?v=4"></script>
   </body>
 </html>

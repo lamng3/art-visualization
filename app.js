@@ -1,27 +1,35 @@
-import {SRC, RANGE, HELP, TERM, traceInsert, traceSearch, vis, q, esc} from './art.js?v=3';
+import {SRC, RANGE, HELP, HELP_NAME, TERM, traceInsert, traceSearch, traceRange, vis, q, esc} from './art.js?v=4';
 
 const SCEN = {
   patricia: {
     words: 'romane romanus romulus rubens ruber rubicon rubicundus',
     queries: 'rubicon romane rom rubix zebra',
+    lo: 'romanus', hi: 'rubicon',
+    rhint: 'Seeks "romanus" (an exact leaf), then the first word past "rubicon", then walks between them: climbing out of subtrees and diving into the next one.',
     hint: 'Hits every branch: empty root, lazy expansion of a leaf, path compression splits at different depths, and descent.',
     qhint: 'Finds a stored word, then fails four ways: a prefix of stored words ("rom"), a leaf with a different tail ("rubix"), a prefix mismatch ("zebra").',
   },
   grow: {
     words: 'cat cab car can cap',
     queries: 'cap cow ca',
+    lo: 'can', hi: 'car',
+    rhint: 'Five leaves under one Node16. The scan moves sideways inside a single node by bumping the next child index.',
     hint: 'Five keys share "ca". The fifth child does not fit in a Node4, so grow() bumps it to Node16 before addChild.',
     qhint: 'All five children now live in one Node16. "cow" leaves the compressed prefix, "ca" ends inside it.',
   },
   term: {
     words: 'a ab abc',
     queries: 'ab abcd b',
+    lo: 'a', hi: 'ab',
+    rhint: '"a" sorts before "ab" because TERM is the smallest byte, so the scan returns a prefix key before its extensions.',
     hint: '"a" is a prefix of "ab". TERM gives each key its own edge (␀), and the third insert creates an inner node with an empty prefix.',
     qhint: '"ab" is stored although it is a prefix of "abc": TERM keeps it at its own leaf. "abcd" is not stored although "abc" is.',
   },
   dup: {
     words: 'tea ten tea',
     queries: 'tea ten te',
+    lo: 'te', hi: 'tf',
+    rhint: 'Both ends fall in the gap between stored keys: "te" mismatches the subtree prefix on the left, "tf" on the right.',
     hint: 'The second "tea" reaches a leaf whose stored key matches from depth onward, so insert returns without touching the tree.',
     qhint: 'The duplicate "tea" left the tree unchanged, so it holds two keys. "te" is only a prefix.',
   },
@@ -62,6 +70,9 @@ function svgTree(root, hl, kd0) {
     if (hl.cur === n.id) c.push('is-cur');
     if (hl.fresh.has(n.id)) c.push('is-fresh');
     if (hl.bad.has(n.id)) c.push('is-bad');
+    if (hl.range.has(n.id)) c.push('is-range');
+    if (hl.out.has(n.id)) c.push('is-out');
+    if (hl.end.has(n.id)) c.push('is-end');
     s += `<g class="${c.join(' ')}" transform="translate(${x} ${y})"><rect class="box" width="${w}" height="${h}" rx="${n.end ? h / 2 : 6}"/><text class="nid" x="${n.end ? 12 : 2}" y="-6">#${n.id}</text>`;
     if (n.end) {
       const cut = Math.min(n._kd, n.content.length);
@@ -96,7 +107,7 @@ function keyStrip(kv) {
   let h = `<div class="ks" style="grid-template-columns:4.6rem repeat(${N}, var(--cell))">`;
   h += `<span class="lab ix"></span>`;
   for (let i = 0; i < N; i++) h += `<span class="ix">${i}</span>`;
-  h += `<span class="lab">key</span>`;
+  h += `<span class="lab">${esc(kv.keyLabel || 'key')}</span>`;
   for (let i = 0; i < N; i++) {
     if (i >= key.length) { h += `<span class="c none"></span>`; continue; }
     const ch = key[i], cl = ['c'];
@@ -162,33 +173,44 @@ function buildCode() {
   $('codeMeta').textContent = `lines ${a}-${b} · dot = ran during this ${op}`;
 }
 
+let rng = {lo: '', hi: ''};
 function load(words, queries) {
   stop();
   const ins = traceInsert(words);
   if (op === 'insert') { STEPS = ins.steps; WORDS = words; }
-  else { STEPS = traceSearch(ins.root, queries).steps; WORDS = queries; }
+  else if (op === 'search') { STEPS = traceSearch(ins.root, queries).steps; WORDS = queries; }
+  else { STEPS = traceRange(ins.root, rng.lo, rng.hi).steps; WORDS = [`seek first ≥ ${rng.lo}`, `seek first > ${rng.hi}`, 'scan']; }
   idx = 0;
   buildCode();
   starts = WORDS.map((_, i) => STEPS.findIndex(s => s.wi === i));
   const res = WORDS.map((_, i) => { const d = STEPS.filter(s => s.wi === i && s.done)[0]; return d ? d.found : undefined; });
   $('scrub').max = STEPS.length - 1;
-  $('chips').innerHTML = `<span class="lbl">${op === 'insert' ? 'Inserts' : 'Searches'}</span>` +
+  $('chips').innerHTML = `<span class="lbl">${{insert: 'Inserts', search: 'Searches', range: 'Phases'}[op]}</span>` +
     WORDS.map((w, i) => `<button class="chip" data-wi="${i}" type="button"><span class="n">${i + 1}</span>${esc(w)}${res[i] === undefined ? '' : `<span class="r ${res[i] ? 'y' : 'n'}">${res[i] ? '✓' : '✗'}</span>`}</button>`).join('');
   $('scratchPane').hidden = op === 'search';
   $('scratchPane').parentElement.classList.toggle('one', op === 'search');
+  $('scratchH').textContent = op === 'range' ? 'Iterator state' : 'Detached nodes';
+  $('scratchM').textContent = op === 'range' ? 'stack = path from the root, [i/n] = next child' : 'built, not yet linked from root';
+  document.querySelectorAll('[data-op]').forEach(el => { el.hidden = !el.dataset.op.split(' ').includes(op); });
   render();
 }
 
-const TAG = {'Lazy expansion': 't-fresh', 'Path compression': 't-accent', Grow: 't-cursor', Done: 't-fresh', 'Add child': 't-fresh', Descend: 't-cursor', Found: 't-fresh', 'Not found': 't-miss'};
+const TAG = {'Lazy expansion': 't-fresh', 'Path compression': 't-accent', Grow: 't-cursor', Done: 't-fresh', 'Add child': 't-fresh', Descend: 't-cursor', Found: 't-fresh', 'Not found': 't-miss', Seek: 't-accent', Climb: 't-cursor', Leftmost: 't-cursor', Emit: 't-fresh', 'Range start': 't-fresh', 'Range end': 't-miss', Mismatch: 't-miss', End: 't-miss', Scan: 't-accent', Leaf: 't-accent'};
+
+function itHtml(it) {
+  const stk = st => st.stack.length ? st.stack.map(e => `<span class="se">#${e.id}<i>${e.i}/${e.n}</i></span>`).join('') : '<span class="empty-s">empty</span>';
+  const lf = st => st.leaf ? `#${st.leaf.id} ${q(st.leaf.w)}` : 'None';
+  return ['low', 'high'].map(k => `<div class="itr${it.active === k ? ' act' : ''}"><div class="itr-h"><code>${k}</code>leaf = ${esc(lf(it[k]))}</div><div class="stk"><span class="lab">stack</span>${stk(it[k])}</div></div>`).join('') +
+    `<div class="itr"><div class="itr-h"><code>out</code></div><div class="outl">${it.out.length ? it.out.map(w => `<span class="ow">${esc(w)}</span>`).join('') : '<span class="empty-s">empty</span>'}</div></div>`;
+}
 
 function render() {
   const s = STEPS[idx];
-  const hl = {cur: s.cur, fresh: new Set(s.fresh), bad: new Set(s.bad), path: new Set(s.path), edges: s.edges};
-  const fnName = s.op === 'insert' ? (s.line >= 85 ? 'insert' : '_insert') : (s.line <= 91 ? 'search' : '_search');
-  $('note').innerHTML = `<div class="note-h"><span class="ln">line ${s.line}</span>${s.tag ? `<span class="tag ${TAG[s.tag] || ''}">${esc(s.tag)}</span>` : ''}<span class="call">${fnName} · ${s.op}(${esc(q(s.word))})</span></div><p>${s.note}</p>`;
+  const hl = {cur: s.cur, fresh: new Set(s.fresh), bad: new Set(s.bad), path: new Set(s.path), edges: s.edges, range: new Set(s.range || []), out: new Set(s.emitted || []), end: new Set(s.end || [])};
+  $('note').innerHTML = `<div class="note-h"><span class="ln">line ${s.line}</span>${s.tag ? `<span class="tag ${TAG[s.tag] || ''}">${esc(s.tag)}</span>` : ''}<span class="call">${esc(s.fn)} · ${s.op === 'range' ? `range(${esc(q(rng.lo))}, ${esc(q(rng.hi))})` : `${s.op}(${esc(q(s.word))})`}</span></div><p>${s.note}</p>`;
 
   if (prevLine && lineEls[prevLine]) { lineEls[prevLine].classList.remove('now'); const old = lineEls[prevLine].querySelector('.inl'); if (old) old.remove(); }
-  const seen = new Set(); for (let j = idx; j >= 0 && STEPS[j].wi === s.wi; j--) seen.add(STEPS[j].line);
+  const seen = new Set(); for (let j = idx; j >= 0 && (op === 'range' || STEPS[j].wi === s.wi); j--) seen.add(STEPS[j].line);
   for (const [ln, el] of Object.entries(lineEls)) el.classList.toggle('seen', seen.has(+ln));
   const el = lineEls[s.line];
   el.classList.add('now');
@@ -204,12 +226,12 @@ function render() {
       const [a, b] = HELP[name];
       let pre = '';
       for (let n = a; n <= b; n++) pre += `<span class="g">${n}</span>${hi(SRC[n - 1])}\n`;
-      return `<div class="hb"><div class="hb-h">calls <b>${name === 'TrieNode' ? 'TrieNode.__init__' : name}</b> · lines ${a}-${b}</div><pre>${pre.replace(/\n$/, '')}</pre></div>`;
+      return `<div class="hb"><div class="hb-h">calls <b>${HELP_NAME[name] || name}</b> · lines ${a}-${b}</div><pre>${pre.replace(/\n$/, '')}</pre></div>`;
     }).join('');
   } else help.hidden = true;
 
   $('keyStrip').innerHTML = keyStrip(s.kv);
-  $('keyMeta').textContent = s.kv.depth !== null && s.kv.depth !== undefined ? `depth = ${s.kv.depth} · grey = already consumed` : 'key = word + TERM';
+  $('keyMeta').textContent = s.kv.depth !== null && s.kv.depth !== undefined ? `depth = ${s.kv.depth} · grey = already consumed` : op === 'range' ? 'lo = word + TERM · end = hi + TERM + TERM' : 'key = word + TERM';
 
   const tw = $('tree');
   if (s.tree) {
@@ -220,7 +242,7 @@ function render() {
   $('keyCount').textContent = `· ${s.keys} key${s.keys === 1 ? '' : 's'}`;
 
   const DESC = {leaf: 'new key, waiting to be linked', new: 'replacement parent, built off-tree', tail: "old node's lower half", copy: 'copy of the old leaf (no variable name)'};
-  $('scratch').innerHTML = s.scratch.length
+  $('scratch').innerHTML = op === 'range' ? itHtml(s.it) : s.scratch.length
     ? s.scratch.map(x => `<figure class="scr"><figcaption><code>${x.name}</code>${DESC[x.name]}</figcaption><div class="sv">${svgTree(x.tree, hl, 0)}</div></figure>`).join('')
     : `<p class="empty">Nothing detached. Every node this frame holds is reachable from root.</p>`;
 
@@ -263,21 +285,22 @@ document.addEventListener('keydown', e => {
 /* ---------- form ---------- */
 const parse = txt => txt.split(/[\s,]+/).map(w => w.replace(/[^\x21-\x7e]/g, '')).filter(Boolean);
 function setHint() {
-  const sc = SCEN[$('preset').value];
-  $('hint').textContent = sc ? (op === 'insert' ? sc.hint : sc.qhint)
+  const sc = SCEN[$('preset').value], k = {insert: 'hint', search: 'qhint', range: 'rhint'}[op];
+  $('hint').textContent = sc ? sc[k]
     : op === 'insert' ? 'Your own words. Up to 10, each up to 14 characters. Repeat a word to see the duplicate path.'
-                      : 'Words are inserted first (silently), then each query is searched step by step.';
+    : op === 'search' ? 'Words are inserted first (silently), then each query is searched step by step.'
+    : 'Words are inserted first (silently), then every word w with lo <= w <= hi is scanned out in sorted order.';
 }
 function setScenario(k) {
   $('preset').value = k;
-  if (SCEN[k]) { $('words').value = SCEN[k].words; $('queries').value = SCEN[k].queries; }
+  if (SCEN[k]) { $('words').value = SCEN[k].words; $('queries').value = SCEN[k].queries; $('lo').value = SCEN[k].lo; $('hi').value = SCEN[k].hi; }
   setHint();
 }
 function setOp(o) {
   op = o;
-  $('opInsert').setAttribute('aria-pressed', o === 'insert');
-  $('opSearch').setAttribute('aria-pressed', o === 'search');
-  $('fldQ').hidden = o === 'insert';
+  for (const [id, name] of [['opInsert', 'insert'], ['opSearch', 'search'], ['opRange', 'range']]) $(id).setAttribute('aria-pressed', o === name);
+  $('fldQ').hidden = o !== 'search';
+  $('fldLo').hidden = $('fldHi').hidden = o !== 'range';
   $('words').previousElementSibling.textContent = o === 'insert' ? 'Words, in insert order' : 'Words in the tree';
   setHint();
 }
@@ -288,15 +311,22 @@ function run() {
   if (w.length > 10 || w.some(x => x.length > 14)) return bad('Keep it to 10 words of at most 14 characters so the tree stays readable.');
   if (op === 'search' && !qs.length) return bad('Enter at least one word to search for.');
   if (qs.length > 10 || qs.some(x => x.length > 14)) return bad('Keep it to 10 queries of at most 14 characters.');
+  const [lo, hi] = [parse($('lo').value)[0], parse($('hi').value)[0]];
+  if (op === 'range' && (!lo || !hi)) return bad('Enter both ends of the range.');
+  if (op === 'range' && (lo.length > 14 || hi.length > 14)) return bad('Keep each end of the range to 14 characters.');
   err.hidden = true;
+  rng = {lo: lo || '', hi: hi || ''};
   load(w, qs);
 }
 $('opInsert').onclick = () => { setOp('insert'); run(); };
 $('opSearch').onclick = () => { setOp('search'); run(); };
+$('opRange').onclick = () => { setOp('range'); run(); };
 $('preset').onchange = e => { setScenario(e.target.value); if (e.target.value !== 'custom') run(); };
 const custom = () => { if ($('preset').value !== 'custom') { $('preset').value = 'custom'; setHint(); } };
 $('words').oninput = custom;
 $('queries').oninput = custom;
+$('lo').oninput = custom;
+$('hi').oninput = custom;
 $('runForm').onsubmit = e => { e.preventDefault(); run(); };
 window.addEventListener('resize', () => { if (STEPS.length) render(); });
 

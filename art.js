@@ -1,7 +1,8 @@
 /* ART engine: the Python source shown on the page, and a traced JS port of it.
    Every executed line of insert/_insert and search/_search records one snapshot (a "step"). */
 
-export const PY = String.raw`TERM = "\0" # ends every key, so no key is a prefix of another
+export const PY = String.raw`from bisect import bisect_left, insort
+TERM = "\0" # ends every key, so no key is a prefix of another
 SIZES = (4, 16, 48, 256)
 
 class TrieNode:
@@ -9,6 +10,7 @@ class TrieNode:
         self.size = size
         self.content = content
         self.children = {} if children is None else children
+        self.keys = sorted(self.children) # edge bytes in order, for range scans
         self.end = end
 
 class ART:
@@ -49,10 +51,11 @@ class ART:
     def addChild(self, node: TrieNode, c: str, child: TrieNode) -> None:
         """add a child to node"""
         node.children[c] = child
+        insort(node.keys, c)
 
     def replace(self, node: TrieNode, new: TrieNode) -> None:
         """node becomes new, in place, so its parent needs no update"""
-        node.size, node.content, node.children, node.end = new.size, new.content, new.children, new.end
+        node.size, node.content, node.children, node.keys, node.end = new.size, new.content, new.children, new.keys, new.end
 
     def _insert(self, node: TrieNode, key: str, leaf: TrieNode, depth: int) -> None:
         if node is None: # empty tree
@@ -100,11 +103,97 @@ class ART:
         if p != len(node.content): return False # path compression: the key leaves the compressed prefix
         depth += len(node.content) # content fully matched
         c = key[depth]
-        return self._search(self.findChild(node, c), key, depth + 1)`;
+        return self._search(self.findChild(node, c), key, depth + 1)
+
+class ARTIterator:
+    """sorted iterator, starts at the first word >= word (> word if after)"""
+    def __init__(self, art: ART, word: str, after: bool = False):
+        self.stack = [] # path from root to leaf: [node, keys, next child index]
+        self.leaf = self._seek(art.root, word + TERM + (TERM if after else ""))
+
+    def _leftmost(self, node: TrieNode) -> TrieNode:
+        """go down to the smallest leaf"""
+        while not node.end:
+            self.stack.append([node, node.keys, 1])
+            node = node.children[node.keys[0]]
+        return node
+
+    def _next(self) -> TrieNode:
+        """go up to an ancestor with an unvisited child, then down"""
+        while self.stack:
+            node, keys, i = self.stack.pop()
+            if i < len(keys):
+                self.stack.append([node, keys, i + 1]) # child i is visited
+                return self._leftmost(node.children[keys[i]])
+        return None
+
+    def _seek(self, node: TrieNode, lo: str) -> TrieNode:
+        """first leaf with key >= lo"""
+        depth = 0
+        while node is not None:
+            if node.end:
+                return node if node.content >= lo else self._next()
+            part = lo[depth:depth + len(node.content)]
+            if node.content != part: # whole subtree is on one side of lo
+                return self._leftmost(node) if node.content > part else self._next()
+            depth += len(node.content)
+            c = lo[depth]
+            j = bisect_left(node.keys, c) # first edge >= c
+            if j < len(node.keys) and node.keys[j] == c:
+                self.stack.append([node, node.keys, j + 1])
+                node = node.children[c]
+                depth += 1
+            else:
+                self.stack.append([node, node.keys, j]) # _next goes to child j, or up
+                return self._next()
+        return None
+
+    def hasNext(self) -> bool:
+        return self.leaf is not None
+
+    def next(self) -> str:
+        word = self.leaf.content[:-1] # drop TERM
+        self.leaf = self._next()
+        return word
+
+class RangeIter:
+    """sorted iterator over the words s with lo <= s <= hi"""
+    def __init__(self, art: ART, lo: str, hi: str):
+        self.low = ARTIterator(art, lo) # first word >= lo
+        self.high = ARTIterator(art, hi, True) # first word > hi, the end
+
+    def hasNext(self) -> bool:
+        if not self.low.hasNext(): return False
+        return not self.high.hasNext() or self.low.leaf.content < self.high.leaf.content
+
+    def next(self) -> str:
+        return self.low.next()
+
+def rangeScan(art: ART, lo: str, hi: str) -> list: # driver, not part of the iterator
+    it = RangeIter(art, lo, hi)
+    out = []
+    while it.hasNext():
+        out.append(it.next())
+    return out`;
 
 export const SRC = PY.split('\n');
-export const RANGE = {insert: [54, 87], search: [89, 100]};
-export const HELP = {TrieNode: [5, 9], isLeaf: [15, 17], loadKey: [19, 21], leafMatches: [23, 25], checkPrefix: [27, 32], findChild: [34, 36], isFull: [38, 40], grow: [42, 44], addChild: [46, 48], replace: [50, 52]};
+const lineOf = t => SRC.findIndex(l => l.includes(t)) + 1;
+/* 1-based [first, last] lines of the method whose def starts at 0-based index i */
+const blockAt = i => { let j = i + 1; while (j < SRC.length && SRC[j].startsWith('        ')) j++; return [i + 1, j]; };
+const methodAt = (name, after = 0) => blockAt(SRC.findIndex((l, i) => i >= after && l.startsWith(`    def ${name}(`)));
+/* the tracers below were written against the unshifted listing, where _insert starts at line 54 */
+export const SHIFT = lineOf('def _insert(') - 54;
+export const RANGE = {
+  insert: [lineOf('def _insert('), lineOf('self._insert(self.root')],
+  search: [lineOf('def search('), lineOf('return self._search(self.findChild')],
+  range: [lineOf('class ARTIterator'), SRC.length],
+};
+export const HELP = {
+  TrieNode: methodAt('__init__'),
+  ...Object.fromEntries(['isLeaf', 'loadKey', 'leafMatches', 'checkPrefix', 'findChild', 'isFull', 'grow', 'addChild', 'replace'].map(n => [n, methodAt(n)])),
+  itHasNext: methodAt('hasNext', SRC.findIndex(l => l.includes('class ARTIterator'))),
+};
+export const HELP_NAME = {TrieNode: 'TrieNode.__init__', itHasNext: 'ARTIterator.hasNext'};
 
 export const TERM = '\0', SIZES = [4, 16, 48, 256];
 
@@ -151,7 +240,7 @@ export function traceInsert(words) {
     const v = Object.assign({}, top.v);
     for (const nm of ['node', 'leaf', 'new', 'tail', 'nextNode']) if (nm in top.nodes) v[nm] = lab(top.nodes[nm]);
     steps.push({
-      op: 'insert', line, word, wi, tree, scratch, uid: top.uid,
+      op: 'insert', fn: top.fn, line: line + SHIFT, word, wi, tree, scratch, uid: top.uid,
       vars: ORDER.filter(k => k in v).map(k => [k, String(v[k])]),
       stack: frames.map(f => f.fn === 'insert' ? `insert(${q(f.word)})` : `_insert(node=${f.nodes.node ? '#' + f.nodes.node.id : 'None'}, depth=${f.v.depth})`).reverse(),
       cur: o.cur !== undefined ? o.cur : (top.nodes.node ? top.nodes.node.id : null),
@@ -315,7 +404,7 @@ export function traceSearch(root, queries) {
     const v = Object.assign({}, top.v);
     if (top.fn === '_search') v.node = lab(top.node);
     steps.push({
-      op: 'search', line, word, wi, tree, scratch: [], uid: top.uid,
+      op: 'search', fn: top.fn, line: line + SHIFT, word, wi, tree, scratch: [], uid: top.uid,
       vars: ORDER.filter(k => k in v).map(k => [k, String(v[k])]),
       stack: frames.map(f => f.fn === 'search' ? `search(${q(f.word)})` : `_search(node=${f.node ? '#' + f.node.id : 'None'}, depth=${f.v.depth})`).reverse(),
       cur: o.cur !== undefined ? o.cur : (top.node ? top.node.id : null),
@@ -411,4 +500,247 @@ export function traceSearch(root, queries) {
       note: why + (nextW !== undefined ? ` Next up: <code>search(${esc(q(nextW))})</code>.` : ` That was the last query.`)});
   }
   return {steps};
+}
+
+/* ---------- traced range scan: ARTIterator + RangeIter, on the tree that insert built ---------- */
+const F = (marker, text) => {
+  const a = SRC.findIndex(l => l.includes(marker));
+  const b = SRC.findIndex((l, i) => i >= a && l.includes(text));
+  if (a < 0 || b < 0) throw new Error(`source line not found: ${marker} / ${text}`);
+  return b + 1;
+};
+const LN = {
+  rsIt: F('def rangeScan', 'it = RangeIter'), rsOut: F('def rangeScan', 'out = []'), rsWhile: F('def rangeScan', 'while it.hasNext()'),
+  rsApp: F('def rangeScan', 'out.append'), rsRet: F('def rangeScan', 'return out'),
+  riLow: F('class RangeIter', 'self.low = ARTIterator'), riHigh: F('class RangeIter', 'self.high = ARTIterator'),
+  riHn1: F('class RangeIter', 'if not self.low.hasNext()'), riHn2: F('class RangeIter', 'return not self.high.hasNext()'), riNext: F('class RangeIter', 'return self.low.next()'),
+  itStack: F('class ARTIterator', 'self.stack = []'), itLeaf: F('class ARTIterator', 'self.leaf = self._seek'),
+  inNext1: F('class ARTIterator', 'word = self.leaf.content[:-1]'), inNext2: F('class ARTIterator', 'self.leaf = self._next()'), inNext3: F('class ARTIterator', 'return word'),
+  lmWhile: F('def _leftmost', 'while not node.end'), lmPush: F('def _leftmost', 'self.stack.append'), lmDown: F('def _leftmost', 'node = node.children'), lmRet: F('def _leftmost', 'return node'),
+  nxWhile: F('def _next', 'while self.stack'), nxPop: F('def _next', 'self.stack.pop()'), nxIf: F('def _next', 'if i < len(keys)'), nxPush: F('def _next', 'self.stack.append'),
+  nxRet: F('def _next', 'return self._leftmost'), nxNone: F('def _next', 'return None'),
+  skDepth: F('def _seek', 'depth = 0'), skWhile: F('def _seek', 'while node is not None'), skEnd: F('def _seek', 'if node.end'), skLeafRet: F('def _seek', 'return node if node.content'),
+  skPart: F('def _seek', 'part = lo['), skNe: F('def _seek', 'if node.content != part'), skSide: F('def _seek', 'return self._leftmost(node) if'),
+  skDepthAdd: F('def _seek', 'depth += len(node.content)'), skC: F('def _seek', 'c = lo[depth]'), skJ: F('def _seek', 'j = bisect_left'), skIf: F('def _seek', 'if j < len(node.keys)'),
+  skPush1: F('def _seek', 'self.stack.append([node, node.keys, j + 1])'), skDown: F('def _seek', 'node = node.children[c]'), skDepth1: F('def _seek', 'depth += 1'),
+  skPush2: F('def _seek', 'self.stack.append([node, node.keys, j])'), skNext: F('def _seek', 'return self._next()'), skNone: F('def _seek', 'return None'),
+};
+const ORDER_R = ['word', 'after', 'lo', 'hi', 'low.leaf', 'high.leaf', 'node', 'depth', 'part', 'c', 'keys', 'j', 'i', 'out'];
+const fk = keys => '[' + keys.map(k => q(k)).join(', ') + ']';
+const bisectLeft = (a, x) => { let l = 0, h = a.length; while (l < h) { const m = (l + h) >> 1; if (a[m] < x) l = m + 1; else h = m; } return l; };
+const leafList = (n, out = []) => { if (n.end) out.push(n); else n.children.forEach(ch => leafList(ch, out)); return out; };
+
+export function traceRange(root, lo, hi) {
+  const steps = [], frames = [];
+  const low = {stack: [], leaf: null}, high = {stack: [], leaf: null}, out = [];
+  let fu = 0, phase = 0, moves = 0, scanning = false, rangeOn = false, active = low, key = lo + TERM;
+  const keysOf = n => [...n.children.keys()].sort();
+  const loK = lo + TERM, hiK = hi + TERM + TERM;
+  const inRange = root ? leafList(root).filter(l => l.content >= loK && l.content < hiK).map(l => l.id) : [];
+  const treeC = () => clone(root);
+  const snapIt = it => ({stack: it.stack.map(([n, k, i]) => ({id: n.id, i, n: k.length})), leaf: it.leaf ? {id: it.leaf.id, w: it.leaf.content} : null});
+  const frame = (fn, v, label) => { const f = {fn, v, label, uid: ++fu, node: null}; frames.push(f); return f; };
+  const leafTxt = l => l ? `#${l.id} ${q(l.content)}` : 'None';
+
+  function S(line, o = {}) {
+    const top = frames[frames.length - 1];
+    const v = Object.assign({}, top.v);
+    if (top.fn === 'RangeIter.hasNext' || top.fn === 'RangeIter.next' || top.fn === 'ARTIterator.next') { v['low.leaf'] = leafTxt(low.leaf); v['high.leaf'] = leafTxt(high.leaf); }
+    if (top.fn === 'rangeScan') v.out = fk(out.map(x => x.w));
+    const tree = treeC();
+    steps.push({
+      op: 'range', fn: top.fn, line, word: lo, wi: phase, tree, scratch: [], uid: top.uid,
+      vars: ORDER_R.filter(k => k in v).map(k => [k, String(v[k])]),
+      stack: frames.map(f => f.label()).reverse(),
+      cur: o.cur !== undefined ? o.cur : (top.node ? top.node.id : null),
+      path: (o.it || active).stack.map(e => e[0].id),
+      fresh: o.fresh || [], bad: [], end: high.leaf && (rangeOn || phase === 1) ? [high.leaf.id] : [],
+      range: rangeOn ? inRange : [], emitted: out.map(x => x.id), edges: o.edges || [],
+      kv: Object.assign({key, depth: null}, o.kv || {}),
+      note: o.note || '', inline: o.inline || '', tag: o.tag || '', helper: o.helper || [], done: !!o.done,
+      keys: leaves(tree),
+      it: {low: snapIt(low), high: snapIt(high), out: out.map(x => x.w), active: active === low ? 'low' : 'high'},
+    });
+  }
+
+  function leftmost(node, it) {
+    const f = frame('_leftmost', {node: lab(node)}, () => `_leftmost(node=#${f.node.id})`); f.node = node;
+    while (true) {
+      const inner = !node.end;
+      S(LN.lmWhile, {tag: 'Leftmost', inline: `not node.end → ${py(inner)}`, kv: {},
+        note: inner ? `#${node.id} is an inner node, so the smallest key is still further down.` : `#${node.id} is a leaf: the smallest key of this subtree.`});
+      if (!inner) break;
+      const keys = keysOf(node); it.stack.push([node, keys, 1]);
+      S(LN.lmPush, {tag: 'Leftmost', inline: `push [#${node.id}, keys, 1]`,
+        note: `Remember #${node.id} on the stack with next child index 1: its child 0 is about to be visited, so the scan resumes at child 1 later.`});
+      const parent = node, k0 = keys[0];
+      node = node.children.get(k0); f.node = node; f.v.node = lab(node); if (scanning) moves++;
+      S(LN.lmDown, {tag: 'Leftmost', inline: `node = #${node.id}`, edges: [{from: parent.id, c: k0, kind: 'follow'}],
+        note: `Always take the smallest edge, <code>${esc(q(k0))}</code>. Edge bytes are kept sorted in <code>node.keys</code>, so keys[0] leads to the smallest key.`});
+    }
+    S(LN.lmRet, {tag: 'Leftmost', inline: `return #${node.id}`, fresh: [node.id], note: `The leftmost leaf is ${esc(leafTxt(node))}.`});
+    frames.pop(); return node;
+  }
+
+  function nextFn(it) {
+    const f = frame('_next', {}, () => `_next(stack depth ${it.stack.length})`);
+    while (true) {
+      const has = it.stack.length > 0;
+      S(LN.nxWhile, {tag: 'Climb', inline: `stack → ${py(has)}`, kv: {}, note: has ? `The stack still holds ancestors that may have an unvisited child.` : `The stack is empty: there are no ancestors left to try.`});
+      if (!has) break;
+      const [node, keys, i] = it.stack.pop(); if (scanning) moves++;
+      f.node = node; f.v.node = lab(node); f.v.keys = fk(keys); f.v.i = i;
+      S(LN.nxPop, {tag: 'Climb', inline: `pop → #${node.id}, i = ${i}`, note: `Climb one level: pop #${node.id}. Its next unvisited child index is ${i} of ${keys.length}.`});
+      const more = i < keys.length;
+      S(LN.nxIf, {tag: 'Climb', inline: `${i} < ${keys.length} → ${py(more)}`,
+        note: more ? `Child ${i} (edge <code>${esc(q(keys[i]))}</code>) has not been visited, so the next key is below it.` : `All ${keys.length} children are done. Keep climbing.`});
+      if (more) {
+        it.stack.push([node, keys, i + 1]);
+        S(LN.nxPush, {tag: 'Climb', inline: `push [#${node.id}, keys, ${i + 1}]`, note: `Put #${node.id} back with index ${i + 1}, because child ${i} is about to be visited.`});
+        const child = node.children.get(keys[i]);
+        S(LN.nxRet, {tag: 'Descend', inline: `_leftmost(#${child.id})`, edges: [{from: node.id, c: keys[i], kind: 'follow'}], note: `Dive into child ${i}, down to its smallest leaf.`});
+        const r = leftmost(child, it); frames.pop(); return r;
+      }
+    }
+    S(LN.nxNone, {tag: 'End', inline: 'return None', cur: null, note: `Nothing is larger. The iterator is exhausted, so its leaf becomes <code>None</code>.`});
+    frames.pop(); return null;
+  }
+
+  function seek(nodeArg, loStr, it) {
+    const f = frame('_seek', {lo: q(loStr), node: lab(nodeArg)}, () => `_seek(node=${f.node ? '#' + f.node.id : 'None'}, depth=${f.v.depth})`);
+    let node = nodeArg, depth = 0; f.node = node; f.v.depth = 0;
+    S(LN.skDepth, {tag: 'Seek', inline: 'depth = 0', kv: {depth: 0}, note: `Start at the root. <code>lo</code> is ${esc(q(loStr))}; we want the first leaf whose key is ≥ lo.`});
+    while (true) {
+      f.node = node; f.v.node = lab(node);
+      S(LN.skWhile, {tag: 'Seek', inline: `node is not None → ${py(node !== null)}`, kv: {depth},
+        note: node ? `Visit ${esc(lab(node))}.` : `There is no tree to search.`});
+      if (node === null) break;
+      if (node.end) {
+        S(LN.skEnd, {tag: 'Leaf', inline: 'node.end → True', kv: {depth}, note: `#${node.id} is a leaf. It stores its full key, so compare the whole key with lo.`});
+        const ok = node.content >= loStr;
+        S(LN.skLeafRet, {tag: 'Leaf', inline: `${q(node.content)} >= ${q(loStr)} → ${py(ok)}${ok ? ' → return node' : ' → _next()'}`, kv: {depth, row2: {label: 'leaf', s: node.content}, cmpFrom: 0},
+          fresh: ok ? [node.id] : [],
+          note: ok ? `The leaf's key is ≥ lo, so it is the first qualifying leaf. Every key to its left was smaller.`
+                   : `The leaf's key is smaller than lo, so it does not qualify. The answer is the next leaf to the right: call <code>_next()</code>.`});
+        if (ok) { frames.pop(); return node; }
+        const r = nextFn(it); frames.pop(); return r;
+      }
+      S(LN.skEnd, {tag: 'Seek', inline: 'node.end → False', kv: {depth}, note: `#${node.id} is an inner Node${node.size} with prefix <code>${esc(q(node.content))}</code>.`});
+      const C = node.content, part = loStr.slice(depth, depth + C.length); f.v.part = q(part);
+      let p = 0; while (p < C.length && p < part.length && C[p] === part[p]) p++;
+      S(LN.skPart, {tag: 'Seek', inline: `part = ${q(part)}`, kv: {depth, row2: {label: 'content', s: C, offset: depth}, match: [depth, depth + p], miss: p < C.length ? depth + p : null},
+        note: `Cut the slice of lo that lines up with this node's prefix: lo[${depth}:${depth + C.length}] = <code>${esc(q(part))}</code>.`});
+      const ne = C !== part;
+      S(LN.skNe, {tag: ne ? 'Mismatch' : 'Seek', inline: `content != part → ${py(ne)}`, kv: {depth, row2: {label: 'content', s: C, offset: depth}, match: [depth, depth + p], miss: p < C.length ? depth + p : null},
+        note: ne ? `The prefix differs from lo. The prefix is stored in the node, so no leaf has to be loaded: every key below this node lies on the same side of lo.`
+                 : `The prefix equals lo's slice, so lo may still be inside this subtree. Keep descending.`});
+      if (ne) {
+        const gt = C > part;
+        S(LN.skSide, {tag: 'Mismatch', inline: `${q(C)} > ${q(part)} → ${py(gt)} → ${gt ? '_leftmost(node)' : '_next()'}`, kv: {depth, row2: {label: 'content', s: C, offset: depth}, match: [depth, depth + p], miss: p < C.length ? depth + p : null},
+          note: gt ? `The whole subtree is greater than lo, so its smallest leaf is the answer: <code>_leftmost(node)</code>.`
+                   : `The whole subtree is smaller than lo, so nothing in it qualifies. <code>_next()</code> moves on to the right of this subtree.`});
+        const r = gt ? leftmost(node, it) : nextFn(it); frames.pop(); return r;
+      }
+      depth += C.length; f.v.depth = depth;
+      S(LN.skDepthAdd, {tag: 'Descend', inline: `depth = ${depth}`, kv: {depth}, note: C.length ? `Skip the ${C.length}-byte prefix in one move.` : `Empty prefix: depth stays at ${depth}.`});
+      const c = loStr[depth]; f.v.c = q(c);
+      S(LN.skC, {tag: 'Descend', inline: `c = ${q(c)}`, kv: {depth, pick: depth}, note: `The next byte of lo is <code>${esc(q(c))}</code>.`});
+      const keys = keysOf(node), j = bisectLeft(keys, c); f.v.keys = fk(keys); f.v.j = j;
+      S(LN.skJ, {tag: 'Descend', inline: `j = ${j}`, kv: {depth, pick: depth},
+        note: `<code>bisect_left</code> is a binary search over this node's sorted edge bytes ${esc(fk(keys))} for the first edge ≥ <code>${esc(q(c))}</code>. It returns index ${j}. This is the only binary search in the scan, and it is over at most ${node.size} edges.`});
+      const hit = j < keys.length && keys[j] === c;
+      S(LN.skIf, {tag: 'Descend', inline: `${j} < ${keys.length} and keys[${j}] == ${q(c)} → ${py(hit)}`, kv: {depth, pick: depth},
+        note: hit ? `The exact edge exists: lo continues inside child ${j}.` : j < keys.length ? `No edge equals <code>${esc(q(c))}</code>. Edge <code>${esc(q(keys[j]))}</code> (index ${j}) is the next larger one.` : `Every edge is smaller than <code>${esc(q(c))}</code>, so nothing here qualifies.`});
+      if (hit) {
+        it.stack.push([node, keys, j + 1]);
+        S(LN.skPush1, {tag: 'Descend', inline: `push [#${node.id}, keys, ${j + 1}]`, kv: {depth, pick: depth},
+          note: `Remember the way back. Once child ${j} is finished, the scan continues at child ${j + 1} of #${node.id}.`});
+        const parent = node; node = node.children.get(c); f.node = node; f.v.node = lab(node);
+        S(LN.skDown, {tag: 'Descend', inline: `node = #${node.id}`, kv: {depth, pick: depth}, edges: [{from: parent.id, c, kind: 'follow'}], note: `Follow edge <code>${esc(q(c))}</code> to ${esc(lab(node))}.`});
+        depth += 1; f.v.depth = depth;
+        S(LN.skDepth1, {tag: 'Descend', inline: `depth = ${depth}`, kv: {depth}, note: `The edge byte is consumed, so depth moves up by 1.`});
+      } else {
+        it.stack.push([node, keys, j]);
+        S(LN.skPush2, {tag: 'Descend', inline: `push [#${node.id}, keys, ${j}]`, kv: {depth, pick: depth},
+          note: `Push the node with index ${j}: <code>_next</code> will go to child ${j} (the first edge larger than lo's byte), or climb if there is none.`});
+        S(LN.skNext, {tag: 'Climb', inline: 'return self._next()', kv: {depth, pick: depth}, note: `Hand over to <code>_next()</code>.`});
+        const r = nextFn(it); frames.pop(); return r;
+      }
+    }
+    S(LN.skNone, {tag: 'End', inline: 'return None', note: `The tree is empty, so there is nothing to return.`});
+    frames.pop(); return null;
+  }
+
+  function makeIter(which, word, after) {
+    const it = which === 'low' ? low : high;
+    const f = frame('ARTIterator.__init__', {word: q(word), after: py(after)}, () => `ARTIterator.__init__(word=${q(word)}, after=${py(after)})`);
+    active = it; key = word + TERM + (after ? TERM : '');
+    S(LN.itStack, {tag: 'Setup', inline: 'stack = []', kv: {},
+      note: `An empty stack. Entries are <code>[node, keys, next child index]</code>; together they remember the path from the root to the current leaf, which is all the iterator needs to move right.`});
+    S(LN.itLeaf, {tag: 'Seek', inline: `_seek(root, ${q(key)})`, kv: {},
+      note: after ? `The target is <code>${esc(q(key))}</code>: the word, TERM, and a second TERM. Every stored key is a word followed by one TERM, so no key can equal this one, and the first leaf ≥ it is the first word strictly greater than ${esc(q(word))}.`
+                  : `The target is <code>${esc(q(key))}</code>: the word plus TERM. The first leaf ≥ it is the first word ≥ ${esc(q(word))}.`});
+    it.leaf = seek(root, key, it);
+    S(LN.itLeaf, {tag: 'Seek', inline: `leaf = ${leafTxt(it.leaf)}`, kv: {}, fresh: it.leaf ? [it.leaf.id] : [], cur: it.leaf ? it.leaf.id : null,
+      note: it.leaf ? `The seek found ${esc(leafTxt(it.leaf))}.` : `The seek found nothing: no key is that large.`});
+    frames.pop();
+  }
+
+  /* ----- driver ----- */
+  const rs = frame('rangeScan', {lo: q(lo), hi: q(hi)}, () => `rangeScan(${q(lo)}, ${q(hi)})`);
+  S(LN.rsIt, {tag: 'Setup', inline: `it = RangeIter(art, ${q(lo)}, ${q(hi)})`, kv: {},
+    note: `A range scan <code>[${esc(q(lo))}, ${esc(q(hi))}]</code> is two seeks and a walk. Seek the first word ≥ lo, seek the first word > hi (the end), then walk leaf to leaf until the two meet.`});
+  const ri = frame('RangeIter.__init__', {lo: q(lo), hi: q(hi)}, () => `RangeIter.__init__(lo=${q(lo)}, hi=${q(hi)})`);
+  S(LN.riLow, {tag: 'Setup', inline: `ARTIterator(art, ${q(lo)})`, kv: {}, note: `Build the start iterator: it seeks the first word ≥ <code>${esc(q(lo))}</code>.`});
+  makeIter('low', lo, false);
+  S(LN.riLow, {tag: 'Range start', inline: `low.leaf = ${leafTxt(low.leaf)}`, kv: {}, fresh: low.leaf ? [low.leaf.id] : [], cur: low.leaf ? low.leaf.id : null,
+    note: low.leaf ? `The scan will start at ${esc(leafTxt(low.leaf))}. Its stack holds the path from the root, so the walk can continue to the right.` : `There is no word ≥ lo, so the range is empty.`});
+  phase = 1;
+  S(LN.riHigh, {tag: 'Setup', inline: `ARTIterator(art, ${q(hi)}, True)`, kv: {}, note: `Build the end iterator the same way, with <code>after=True</code>: it seeks the first word strictly greater than <code>${esc(q(hi))}</code>.`});
+  makeIter('high', hi, true);
+  rangeOn = true;
+  S(LN.riHigh, {tag: 'Range end', inline: `high.leaf = ${leafTxt(high.leaf)}`, kv: {},
+    note: (high.leaf ? `The end is ${esc(leafTxt(high.leaf))}, the first word past hi (dashed orange).` : `No word is greater than hi, so the scan will run to the last word.`) +
+          ` Leaves shaded green are the answer: ${inRange.length} word${inRange.length === 1 ? '' : 's'}. The scan has not found them yet; it only knows where to start and stop.`});
+  frames.pop();
+  phase = 2; scanning = true; active = low;
+  S(LN.rsOut, {tag: 'Scan', inline: 'out = []', kv: {}, note: `Now walk. Each step takes <code>low.leaf</code>, then moves <code>low</code> to the next leaf with <code>_next()</code>.`});
+  while (true) {
+    S(LN.rsWhile, {tag: 'Scan', inline: 'it.hasNext()', kv: {}, note: `Ask the iterator whether another word is in range.`});
+    const hn = frame('RangeIter.hasNext', {}, () => 'RangeIter.hasNext()');
+    const lowHas = low.leaf !== null;
+    S(LN.riHn1, {tag: 'Compare', inline: `low.hasNext() → ${py(lowHas)}${lowHas ? '' : ' → return False'}`, helper: ['itHasNext'], kv: {},
+      note: lowHas ? `<code>low.leaf</code> is ${esc(leafTxt(low.leaf))}, so the tree has not run out.` : `<code>low</code> ran off the end of the tree. Return <code>False</code>.`});
+    let ok = false;
+    if (lowHas) {
+      const highHas = high.leaf !== null;
+      const a = low.leaf.content, b = highHas ? high.leaf.content : '';
+      let k = 0; while (highHas && k < a.length && k < b.length && a[k] === b[k]) k++;
+      const lt = highHas ? a < b : true; ok = !highHas || lt;
+      S(LN.riHn2, {tag: 'Compare', helper: ['itHasNext'], kv: highHas ? {key: a, keyLabel: 'low.leaf', row2: {label: 'high.leaf', s: b}, match: [0, k], miss: k < Math.min(a.length, b.length) ? k : null} : {},
+        inline: highHas ? `high.hasNext() → True · ${q(a)} < ${q(b)} → ${py(lt)}` : 'high.hasNext() → False → return True',
+        note: highHas ? `The end is a leaf, so compare the two full keys. They agree up to index ${k}; ${lt ? `<code>${esc(q(a))}</code> sorts first, so low has not reached the end yet.` : `<code>low</code> has reached the end leaf, so the scan is finished.`}`
+                      : `There is no end leaf, so every remaining leaf is in range.`});
+    }
+    frames.pop();
+    if (!ok) { S(LN.rsWhile, {tag: 'Scan', inline: 'it.hasNext() → False', kv: {}, note: `hasNext returned <code>False</code>: leave the loop.`}); break; }
+    S(LN.rsApp, {tag: 'Scan', inline: 'out.append(it.next())', kv: {}, note: `hasNext said yes. Take the word, then move on.`});
+    frame('RangeIter.next', {}, () => 'RangeIter.next()');
+    S(LN.riNext, {tag: 'Scan', inline: 'return self.low.next()', kv: {}, note: `The range iterator just forwards to the start iterator.`});
+    const it = frame('ARTIterator.next', {}, () => 'ARTIterator.next()');
+    const leaf = low.leaf, word = leaf.content.slice(0, -1); it.v.word = q(word);
+    S(LN.inNext1, {tag: 'Emit', inline: `word = ${q(word)}`, kv: {}, note: `Read the word from the current leaf and drop the trailing TERM.`});
+    S(LN.inNext2, {tag: 'Climb', inline: '_next()', kv: {}, note: `Before returning, move <code>low</code> to the next leaf. This is where a B+ tree would follow a sibling pointer. ART has none, so it climbs and descends.`});
+    const before = moves;
+    low.leaf = nextFn(low);
+    S(LN.inNext2, {tag: 'Climb', inline: `leaf = ${leafTxt(low.leaf)}`, kv: {}, fresh: low.leaf ? [low.leaf.id] : [], cur: low.leaf ? low.leaf.id : null,
+      note: `That took ${moves - before} node move${moves - before === 1 ? '' : 's'} (stack pops and descents). The next leaf is ${esc(leafTxt(low.leaf))}.`});
+    S(LN.inNext3, {tag: 'Emit', inline: `return ${q(word)}`, kv: {}, note: `Return the word.`});
+    frames.pop(); frames.pop();
+    out.push({id: leaf.id, w: word});
+    S(LN.rsApp, {tag: 'Emit', inline: `out = ${fk(out.map(x => x.w))}`, kv: {}, cur: leaf.id, note: `<code>${esc(q(word))}</code> is appended. ${out.length} word${out.length === 1 ? '' : 's'} so far.`});
+  }
+  S(LN.rsRet, {tag: 'Done', done: true, kv: {}, cur: null, inline: `return ${fk(out.map(x => x.w))}`,
+    note: `${out.length ? `The scan returned ${out.length} word${out.length === 1 ? '' : 's'} in sorted order.` : 'The range is empty.'} Walking cost ${moves} node move${moves === 1 ? '' : 's'} (stack pops and descents) after the two seeks. A B+ tree would hop one sibling pointer per leaf; ART traverses instead, but its nodes are small and sorted.`});
+  return {steps, words: out.map(x => x.w)};
 }

@@ -1,6 +1,6 @@
 # art-viz
 
-Step through `insert` and `search` in an Adaptive Radix Tree, one executed line at a time.
+Step through `insert`, `search` and range scans (`ARTIterator` / `RangeIter`) in an Adaptive Radix Tree, one executed line at a time.
 Live at https://lamng3.com/art-visualization/
 
 The page shows the Python source with the current line highlighted and its result written inline,
@@ -10,7 +10,7 @@ detached nodes, locals and the call stack. `art.js` holds the Python source and 
 
 ```sh
 python3 -m http.server   # then open http://localhost:8000
-node test.mjs            # line numbers + search agrees with a Set on random inputs
+node test.mjs            # line numbers; search and range scan agree with a Set / sorted array on random inputs
 ```
 
 Persistence and erase are next.
