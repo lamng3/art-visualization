@@ -177,7 +177,7 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 .ks .c.ok { background: var(--fresh-tint); border-color: var(--fresh); color: var(--ink); }
 .ks .c.bad { background: var(--miss-tint); border-color: var(--miss); color: var(--miss); font-weight: 600; }
 .ks .c.pick { background: var(--primary); border-color: var(--primary); color: var(--on-strong); font-weight: 600; }
-.ks .pt { height: 1.2rem; font-size: 10.5px; color: var(--cursor-ink); white-space: nowrap; overflow: visible; font-weight: 600; }
+.ks .pt { justify-content: flex-start; height: 1.2rem; font-size: 10.5px; color: var(--cursor-ink); white-space: nowrap; overflow: visible; font-weight: 600; }
 
 /* tree */
 .tree-pane { grid-area: tree; }

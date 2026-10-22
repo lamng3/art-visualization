@@ -89,9 +89,9 @@ function keyStrip(kv) {
   const key = kv.key, r2 = kv.row2;
   const off = r2 ? (r2.offset || 0) : 0;
   const N = Math.max(key.length, r2 ? off + r2.s.length : 0);
-  const ptr = {};
-  if (kv.depth !== null && kv.depth !== undefined) ptr[kv.depth] = ['depth'];
-  if (kv.ptrs) for (const [i, l] of Object.entries(kv.ptrs)) (ptr[i] = ptr[i] || []).push(l);
+  const ptr = [];
+  if (kv.depth !== null && kv.depth !== undefined) ptr.push([kv.depth, 'depth']);
+  if (kv.ptrs) for (const [i, l] of Object.entries(kv.ptrs)) ptr.push([+i, l]);
   const inM = i => kv.match && i >= kv.match[0] && i < kv.match[1];
   let h = `<div class="ks" style="grid-template-columns:4.6rem repeat(${N}, var(--cell))">`;
   h += `<span class="lab ix"></span>`;
@@ -123,8 +123,11 @@ function keyStrip(kv) {
       h += `<span class="${cl.join(' ')}">${esc(vis(ch))}</span>`;
     }
   }
-  h += `<span class="lab pt"></span>`;
-  for (let i = 0; i < N; i++) h += `<span class="pt">${ptr[i] ? '▲ ' + esc(ptr[i].join(', ')) : ''}</span>`;
+  /* one row per pointer, so labels of neighbouring indices never overlap */
+  for (const [at, label] of ptr) {
+    h += `<span class="lab pt"></span>`;
+    for (let i = 0; i < N; i++) h += `<span class="pt">${i === at ? '▲ ' + esc(label) : ''}</span>`;
+  }
   return h + '</div>';
 }
 
