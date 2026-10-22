@@ -70,7 +70,7 @@ function svgTree(root, hl, kd0) {
     } else {
       const k = n.children.length;
       s += `<text class="nt" x="9" y="15">Node${n.size}</text><text class="no" x="${w - 9}" y="15" text-anchor="end">${k}/${n.size}</text>`;
-      s += `<text class="nc" x="${w / 2}" y="35" text-anchor="middle">${n.content.length ? termSpan('"' + vis(n.content) + '"') : 'ε'}</text>`;
+      s += `<text class="nc" x="${w / 2}" y="35" text-anchor="middle">${n.content.length ? termSpan('"' + vis(n.content) + '"') : '""'}</text>`;
       const sw = w - 18, sx = 9, sy = h - 9;
       if (n.size <= 16) {
         const g = n.size <= 4 ? 3 : 1.5, seg = (sw - g * (n.size - 1)) / n.size;
